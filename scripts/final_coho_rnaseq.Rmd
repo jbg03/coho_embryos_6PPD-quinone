@@ -1,0 +1,1209 @@
+---
+title: "Final RNASeq 6PPD-quinone coho embryos"
+author: "J Greer"
+date: "3/28/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+  
+<!-- Perform setup  -->
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, tidy = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r load packages, echo=FALSE}
+library(org.Hs.eg.db)
+library(tximport)
+library(clusterProfiler)
+library(ggridges)
+library(viridis)
+library(enrichplot)
+library(janitor)
+library(ComplexHeatmap)
+library(cowplot)
+library(FSA)
+library(ggridges)
+library(DESeq2)
+library(DEGreport)
+library(tximport)
+library(ggvenn)
+library(ggforce)
+library(ggsci)
+library(circlize)
+library(readxl)
+library(lubridate)
+library(scales)
+library(readxl)
+library(ggraph)
+library(tidyverse)
+
+```
+
+```{r build metadata, eval=F}
+
+# Building metadata with mapping rates and read depth produced during 
+# coho_embryo_analysis.sh script.
+
+metadata <- read_excel("rna_metadata.xlsx",skip = 1) %>% 
+  clean_names() %>% 
+  dplyr::select(sample_number:nominal_6ppdq_concentration_ug_l) %>% 
+  left_join(., read_csv("../data/trim.stats.csv") %>%
+              mutate(library = str_replace(library,"_S.+","")),
+            by = c("rnaseq_id" = "library")) %>%
+  mutate(input_reads = input_reads / 1000000,
+         output_reads = output_reads / 1000000,
+         treatment = as.factor(treatment)) %>%
+  rename("Input Reads (M)" = "input_reads",
+         "Output Read (M)" = "output_reads") %>%
+  left_join(., read_tsv("../quants/mapping.rates.txt"),
+            by = c("rnaseq_id" = "library")) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  drop_na(percent_retained) %>%
+  filter(!rnaseq_id == "JG18")  ## drop sample 18 with failed sequencing
+
+```
+
+```{r load annotations}
+
+## NCBI annotations, used to match transcripts to genes for tximport
+
+annotations <- read_tsv("annotations/GCF_002021735.2_Okis_V2_feature_table.txt") %>% 
+  clean_names()  %>% 
+  filter(number_feature %in% c("mRNA","ncRNA")) %>% 
+  arrange(name) %>% 
+  dplyr::select(genomic_accession,product_accession,related_accession:gene_id) %>% 
+  mutate(related_accession = str_replace(related_accession,"\\.\\d",""))
+
+
+# ENTREZ and human ids added via "improve_annotations.Rmd" 
+# One match per gene, used downstream of DESeq2 after gene level analysis
+
+final.anno <- read_tsv("annotations/final.annotations.txt")
+
+```
+
+
+### DESeq and Likelihood Ratio Test 
+
+
+
+```{r load DESeq object of all}
+dir="../quants"
+list.files(dir)
+files <- file.path(dir,paste(as.factor(metadata$rnaseq_id)), "quant.sf")
+names(files) <- as.factor(metadata$rnaseq_id)
+all(file.exists(files))  #make sure all files exist
+
+tx2gene <- annotations %>% 
+  dplyr::select(product_accession,gene_id)
+
+# Import quantification files with tximport
+# Aggregated to the gene level
+
+txi <- tximport(files, 
+                type = "salmon", 
+                txOut = F,
+                tx2gene = tx2gene)
+                
+dds <- DESeqDataSetFromTximport(txi, colData = metadata, design = ~ treatment)
+keep <- rowSums(counts(dds)) >= 15
+dds <- dds[keep,]
+dds <- DESeq(dds)
+
+
+## Remove unneeded files
+
+rm(files, txi, tx2gene, keep, dir)
+```
+
+```{r liklihood ratio test in DESeq2 to determine DEGs}
+
+# Calculate differential expression using LRT
+
+dds <- DESeq(dds, test = "LRT", reduced = ~1)
+
+
+## Dataframe of LRT results, add gene annotations
+
+results05 <- results(dds, alpha = 0.05) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "gene") %>% 
+  mutate(gene_id = as.double(gene)) %>% 
+  left_join(., final.anno, by = 'gene_id')
+
+
+## Normalized counts for significant genes at padj < 0.05, needed for degPatterns
+
+norm_counts <- assay(vst(dds, blind=FALSE)) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "gene") %>% 
+  left_join(filter(results05,padj< 0.05), ., by = 'gene') %>% 
+  dplyr::select(gene,JG1:JG28) %>% 
+  column_to_rownames("gene") %>% 
+  as.matrix()
+
+
+# Need rownames assignment and a time variable for degPatterns
+
+lrt.meta <- metadata %>% 
+  column_to_rownames('rnaseq_id')
+lrt.meta$time <- as.numeric(as.factor(lrt.meta$treatment))
+lrt.meta$treatment <- factor(lrt.meta$treatment, levels = c('control', 'low', 'medium', 'high'))
+
+
+# Ensure rownames of meta match colnames of counts 
+
+rownames(lrt.meta)
+colnames(norm_counts)
+
+
+# Cluster DEGs
+
+res_patterns <- DEGreport::degPatterns(
+  ma = norm_counts,
+  metadata = lrt.meta,
+  reduce = T,
+  minc = 10,
+  col = "treatment")
+
+```
+
+```{r create facet_wrap plot of DEG clustering results}
+
+# Extract clusters from degPatterns for custom plots/analysis
+
+lrt.plot.data <- res_patterns$normalized %>%
+  rename('gene_id' = 'genes') %>% 
+  mutate(gene_id = as.numeric(str_replace(gene_id,"X",""))) %>% 
+  dplyr::select(gene_id, value, treatment, cluster) %>% 
+  plyr::join(., final.anno, by = 'gene_id', match = 'first') %>% 
+  mutate(treatment = str_to_sentence(treatment))
+
+
+# Relevel order of treatments
+
+lrt.plot.data$treatment <- factor(lrt.plot.data$treatment,
+                                  levels = c('Control','Low', 'Medium', 'High'), 
+                                  ordered=T)
+
+lrt.plot.data$time <- as.numeric(as.factor(lrt.plot.data$treatment), ordered = T)
+
+
+# Create a dataframe of custom facet labels with number of genes in cluster
+
+lrt.facet.labels <- map_df(1:7, function (i) {
+  data.frame(cluster = i,
+             label = paste('Cluster ',i,': ', nrow(filter(lrt.plot.data,
+                                                          cluster == i))/4,
+                           ' genes',sep = ""))
+})
+
+
+# Join custom labels with rest of lrt data
+
+lrt.plot.data <- left_join(lrt.plot.data,lrt.facet.labels, by = 'cluster') 
+rm(lrt.facet.labels)
+
+  
+## facet_wrap of all clusters
+ggplot(lrt.plot.data, aes(x = treatment,
+                          y = value,
+                          color = treatment)) +
+  theme_bw(base_size = 10) +
+  geom_jitter(alpha = 0.3,
+              size = 0.5,
+              shape = 21,
+              width = 0.2) +
+  theme(axis.title = element_text(size = 11), ##change font size for axis titles
+        legend.text = element_text(size = 11),
+        axis.text.x = element_text(size = 0),
+        legend.title = element_text(size =11),
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.background = element_rect(fill = 'grey94'),
+        legend.position = 'none') +
+  labs(x = "",
+       y = "scaled expression",
+       color = "") +
+  facet_wrap(~ label) +
+  # stat_smooth(aes(x=time,y=value), color = 'black', method = 'loess',
+  #             level = 0.999) +
+  annotate('segment', linetype = 4, x = 0, xend = 4.5,
+           y = 0, yend = 0) +
+  scale_fill_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+  scale_color_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+  stat_summary(fun = mean, colour = "black", 
+               geom="line", aes(group = 1),
+               size = 1) 
+
+
+## remove intermediary files 
+rm(norm_counts, res_patterns) 
+```
+
+Next, calculate zscores for each gene for each individual. Can be used for looking at individual genes and variation
+
+```{r calculate zscores}
+zscores.individuals <- assay(vst(dds, blind=F)) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var= "gene_id") %>% 
+  pivot_longer(cols=-gene_id,
+               names_to = "rnaseq_id",
+               values_to = "count") %>% 
+  dplyr::group_by(gene_id) %>% 
+  mutate(zscore = scale(as.numeric(count))) %>% 
+  ungroup() %>% 
+  dplyr::select(-count) %>% 
+  left_join(.,metadata, by="rnaseq_id") %>% 
+  #dplyr::select(-sample_id) %>% 
+  plyr::join(., final.anno,by="gene_id",match="first",type="left")  
+```
+
+
+### Final Figure 4 heatmap of DEG clusters with geom_smooth panels
+
+```{r Final figure 4 heatmap}
+
+# Format DEGs for complexheatmap
+
+allcluster.hm.data <- lrt.plot.data %>% 
+  select(gene_id,cluster) %>%
+  distinct(gene_id, .keep_all = T) %>% 
+  mutate(gene_id = as.character(gene_id)) %>% 
+  left_join(., zscores.individuals, by = 'gene_id') %>% 
+  pivot_wider(values_from = 'zscore',
+              names_from = 'rnaseq_id',
+              id_cols = c('gene_id','cluster')) %>% 
+  column_to_rownames(var = 'gene_id') %>% 
+  arrange(cluster)
+
+allcluster.hm.data$cluster <- factor(allcluster.hm.data$cluster, 
+                                     levels = c('1','2','3','4','5','6','7'))
+
+# Generate heatmap
+
+allcluster.hm <- 
+  Heatmap(as.matrix(dplyr::select(allcluster.hm.data,-cluster)), 
+          name = "scaled\nexpression",
+          col = colorRamp2(c(-2,0,2),c("cadetblue4","grey20","yellow")),
+          column_names_rot = 45,
+          column_names_gp = gpar(fontsize = 11#, fontface = "bold"
+          ),
+          show_row_names = F,
+          show_column_names = F,
+          cluster_row_slices = F,
+          show_row_dend = F,
+          show_column_dend = F,
+          row_dend_reorder = F,
+          row_title_rot = 0,
+          column_dend_reorder = F,
+          cluster_column_slices = F,
+          row_split = as.matrix(allcluster.hm.data$cluster),
+          column_split = lrt.meta$treatment,
+          column_title = NULL,
+          row_title = NULL,
+          border = F,
+          # Add empty annotation on right side to add ggplots
+          right_annotation = rowAnnotation(ggplot = anno_empty(width = unit(2.1,"cm"),
+                                                               border = F)),
+          top_annotation = HeatmapAnnotation(foo = anno_block(gp = gpar(fill = c(alpha("lightblue3",0.5),
+                                                                                 alpha("khaki3",0.5),
+                                                                                 alpha("darkgoldenrod2",0.5),
+                                                                                 alpha("orangered3",0.5))),
+                                                              labels = c('Control',
+                                                                         expression(paste('0.1 ',mu,'g/l',
+                                                                                          sep = "")),
+                                                                         expression(paste('0.9 ',mu,'g/l',
+                                                                                          sep = "")),
+                                                                         expression(paste('7.2 ',mu,'g/l',
+                                                                                          sep = ""))),
+                                                              labels_gp = gpar(col = 'black',
+                                                                               fontsize=8.7,
+                                                                               fontface = 'bold'),
+                                                              height = unit(0.4,'cm'))),
+          left_annotation = rowAnnotation(foo = anno_block(gp = gpar(fill = NA,
+                                                                     lty ="blank"),
+                                                           labels = c('C1\nn= 107','C2\nn= 628',
+                                                                      'C3\nn= 565','C4\nn= 79',
+                                                                      'C5\nn= 521','C6\nn= 129',
+                                                                      'C7\nn= 63'),
+                                                           labels_gp = gpar(col = 'black',
+                                                                            fontsize = 8),
+                                                           labels_rot = 0,
+                                                           width = unit(0.8,'cm'))),
+          heatmap_legend_param = list(
+            title_gp = gpar(fontsize = 7.5),
+            labels_gp = gpar(fontsize = 8)))
+
+
+draw(allcluster.hm, merge_legend = T, heatmap_legend_side = 'right')  
+
+
+### Function for ggplot with linear model for each cluster
+### Used to decorate right side of heatmap with scatterplot and line
+
+cluster.plot.FUN <- function(i) {
+  ggplot(filter(lrt.plot.data, cluster == i),
+         aes(x = jitter(time),
+             y = value)) +
+    theme_classic(base_size = 9.5) +
+    geom_jitter(aes(color = treatment),
+                alpha = 0.3,
+                size = 0.4,
+                shape = 21,
+                width = 0.08) +
+    theme(axis.text.x = element_text(size = 0),
+          axis.text = element_text(color = 'black'),
+          legend.position = 'none',
+          axis.ticks.x = element_blank(),
+          plot.margin = margin(0,0,-10,0),
+          axis.title.y = element_text(size = 0)) +
+    labs(x = "",
+         y = "z-score",
+         color = "") +
+    stat_smooth(aes(x=time,y=value), color = 'black', method = 'loess') +
+    scale_color_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+    scale_y_continuous(position = 'right', limits = c(-2,2),
+                       breaks = seq(-2,2,2))
+  
+}
+
+
+# Create4 the plots using the function
+
+cluster.plots <- map(c(1:7), cluster.plot.FUN)
+
+
+## Map appropriate ggplots to the complexheatmap
+
+map(1:7, function (i) {
+  decorate_annotation("ggplot", slice = i, {
+    vp = current.viewport()$name
+    print(cluster.plots[[i]], vp = vp)
+  })
+})
+
+allcluster.hm = grid.grab(wrap.grobs = T)
+
+
+# Save final plot
+
+#pdf("~/Desktop/lrt.hm.pdf", height = 11, width = 6)
+#print(allcluster.hm)
+#dev.off()
+
+
+```
+
+
+### Pathway analysis
+
+Pathway analysis (GO and KEGG) for all DEGs
+
+```{r all DEGs pathway analysis}
+
+## GO bio processes ####
+alldeg.go.enrichment <- enrichGO(gene = filter(results05, padj < 0.05)$symbol,
+                             OrgDb = org.Hs.eg.db,
+                             keyType = 'SYMBOL',
+                             universe = results05$symbol,
+                             ont = 'BP',
+                             pAdjustMethod = 'BH',
+                             pvalueCutoff = 1)
+
+alldeg.go.enrichment.simplified <- clusterProfiler::simplify(alldeg.go.enrichment,
+                                                                 cutoff = 0.7,
+                                                                 by = "pvalue",
+                                                                 select_fun = min)
+
+view(as.data.frame(alldeg.go.enrichment.simplified))
+
+
+## KEGG pathways ####
+alldeg.kegg.enrichment <- enrichKEGG(gene = filter(results05, padj < 0.05)$ENTREZID,
+                                         organism = 'hsa',
+                                         pvalueCutoff = 1,
+                                         qvalueCutoff = 1)
+
+
+view(as.data.frame(alldeg.kegg.enrichment))
+
+```
+
+
+Pathway analysis (GO and KEGG) for genes belonging to clusters 2 and 3. Then create cnet plot for ossification, blood vessel development, and skeletal system development. Panel 4C of final figures.
+
+```{r clusters 2 and 3 pathway analysis}
+
+# Filter for genes in clusters 2 and 3
+
+clusters23.pathway.data <- 
+  filter(lrt.plot.data, cluster %in% c(2,3),
+         # values from high treatment correspond to up or down in dose response clusters
+         treatment == 'High') %>% 
+  select(-ENTREZID) %>% 
+  left_join(., bitr(.$symbol, fromType = 'SYMBOL',  ## add ENTREZ ids for KEGG
+                    toType = 'ENTREZID',
+                    OrgDb = org.Hs.eg.db),
+            by = c('symbol' = 'SYMBOL'))
+
+
+## GO bio processes 
+
+clusters23.go.enrichment <- enrichGO(gene = clusters23.pathway.data$symbol,
+                             OrgDb = org.Hs.eg.db,
+                             keyType = 'SYMBOL',
+                             universe = results05$symbol,
+                             ont = 'BP',
+                             pAdjustMethod = 'BH',
+                             pvalueCutoff = 0.05)
+
+clusters23.go.enrichment.simplified <- clusterProfiler::simplify(clusters23.go.enrichment,
+                                                                 cutoff = 0.7,
+                                                                 by = "pvalue",
+                                                                 select_fun = min)
+
+view(as.data.frame(clusters23.go.enrichment))
+
+
+## KEGG pathway enrichment 
+
+clusters23.kegg.enrichment <- enrichKEGG(gene = clusters23.pathway.data$ENTREZID,
+                                         organism = 'hsa',
+                                         pvalueCutoff = 0.05,
+                                         qvalueCutoff = 0.05)
+
+
+view(as.data.frame(clusters23.kegg.enrichment))
+
+## gene set enrichment GSEA ####
+gse.data <- clusters23.pathway.data$value
+names(gse.data) <- clusters23.pathway.data$symbol
+gse.data = sort(gse.data, decreasing = T)
+
+clusters23.gse <- gseGO(geneList = gse.data,
+                        ont = 'BP',
+                        keyType = 'SYMBOL',
+                        pvalueCutoff = 0.05,
+                        OrgDb = org.Hs.eg.db)
+
+
+## plots ####
+
+
+                  
+
+clusters23.pairwiseterms <- enrichplot::pairwise_termsim(clusters23.go.enrichment.simplified)
+treeplot(clusters23.pairwiseterms, hclust_method = 'average')
+emapplot(clusters23.pairwiseterms)
+```
+
+
+
+Pathway analysis of clusters 4 and 7, which show differential expression in all treatments compared to controls. 
+
+```{r clusters 4 and 7 pathway analysis}
+clusters47.pathway.data <- filter(lrt.plot.data, cluster %in% c(4,7),
+                                  # 'values' from high treatment correspond to up or down in dose response clusters
+                                  treatment == 'High') %>% 
+  select(-ENTREZID) %>% 
+  left_join(., bitr(.$symbol, fromType = 'SYMBOL',  ## add ENTREZ ids for KEGG
+                    toType = 'ENTREZID',
+                    OrgDb = org.Hs.eg.db),
+            by = c('symbol' = 'SYMBOL'))
+
+## GO bio processes ####
+clusters47.go.enrichment <- enrichGO(gene = clusters47.pathway.data$symbol,
+                             OrgDb = org.Hs.eg.db,
+                             keyType = 'SYMBOL',
+                             universe = results05$symbol,
+                             ont = 'BP',
+                             pAdjustMethod = 'BH',
+                             pvalueCutoff = 0.05)
+
+clusters47.go.enrichment.simplified <- clusterProfiler::simplify(clusters47.go.enrichment,
+                                                                 cutoff = 0.7,
+                                                                 by = "pvalue",
+                                                                 select_fun = min)
+
+view(as.data.frame(clusters47.go.enrichment))
+
+## KEGG pathways ####
+clusters47.kegg.enrichment <- enrichKEGG(gene = clusters47.pathway.data$ENTREZID,
+                                         organism = 'hsa',
+                                         pvalueCutoff = 1,
+                                         qvalueCutoff = 1)
+
+
+view(as.data.frame(clusters47.kegg.enrichment))
+
+## gene set enrichment GSEA ####
+gse.data <- clusters47.pathway.data$value
+names(gse.data) <- clusters47.pathway.data$symbol
+gse.data = sort(gse.data, decreasing = T)
+
+clusters47.gse <- gseGO(geneList = gse.data,
+                        ont = 'BP',
+                        keyType = 'SYMBOL',
+                        pvalueCutoff = 0.05,
+                        OrgDb = org.Hs.eg.db)
+
+
+## plots ####
+
+## cnet plot
+## first create gene list with fold change for coloring nodes
+gene_list <- clusters47.pathway.data$value
+names(gene_list) <- clusters47.pathway.data$symbol
+gene_list <- na.omit(gene_list)
+gene_list = sort(gene_list, decreasing = T)
+
+cnet <- cnetplot(clusters47.go.enrichment.simplified, 
+                 foldChange = gene_list, 
+                 ## choose relevent categories by row number
+                 showCategory = clusters47.go.enrichment.simplified$Description[c(3,4,7)], 
+                 cex_label_gene = 0.5,
+                 #cex_label_category = 0.9,  # label nodes below using geom_node_text
+                 node_label = 'gene',
+                 colorEdge = F) +  
+  scale_color_gradientn(colours = c('blue','black','orange'),
+                        name = 'scaled expression') 
+
+
+cnet <- cnet +   
+  theme(legend.position = 'none') +
+  geom_node_text(#label = cnet$data[2,3], # blood vessel development
+                 label = 'blood vessel\ndevelopment',
+                 data = cnet$data[2,], 
+                 fontface = 'bold.italic', size =3.5,
+                 color = 'red',
+                 hjust = -1.3,
+                 vjust = 2.8,
+                 lineheight = 0.7) +
+  geom_node_text(label = cnet$data[1,3], # ossification
+                 data = cnet$data[1,], 
+                 fontface = 'bold.italic', size =3.5,
+                 color = 'red',
+                 hjust = 1) +
+  geom_node_text(#label = cnet$data[3,3], # skeletal system development
+                 label = 'skeletal system\ndevelopment',
+                 data = cnet$data[3,], 
+                 fontface = 'bold.italic', size = 3.5,
+                 color = 'red',
+                 lineheight = 0.7,
+                 vjust = 1) +
+  annotate('segment', x = 1.5, xend = -2, y = -5.7, yend = -4.3, size = 1,
+           color = 'red')
+                  
+
+
+clusters47.pairwiseterms <- enrichplot::pairwise_termsim(clusters47.go.enrichment.simplified)
+treeplot(clusters47.pairwiseterms, hclust_method = 'average')
+emapplot(clusters47.pairwiseterms)
+```
+
+
+```{r Fisher exact test for cluster enrichment}
+
+clusters47.fisher.FUN <- function (i) {
+  fisher.data <- as.data.frame(alldeg.go.enrichment) %>% 
+    dplyr::filter(Description == i) %>% 
+    separate_rows(., geneID) %>% 
+    plyr::join(., 
+               lrt.plot.data %>% 
+                 rename('geneID' = 'symbol'),
+               by = "geneID", type = 'left',
+               match = 'first')
+  
+  
+  # total number of DEGs in clusters of interest
+  cluster.total.count = nrow(filter(lrt.plot.data,cluster %in% c(4,7)))/4
+  # total number of DEGs not in clusters of interest
+  other.clusters.total.count = nrow(lrt.plot.data)/4 - cluster.total.count
+  # number of DEGs in selected pathway belonging to clusters of interest
+  cluster.inGO = nrow(filter(fisher.data, cluster %in% c(4,7)))
+  # total number of DEGs in selected pathway
+  GO.total.count = fisher.data[1,]$Count
+  
+  
+  contingency.table <- data.frame("clusters47" = c(cluster.inGO,
+                                                   cluster.total.count - cluster.inGO),
+                                  "NOTclusters47" = c(GO.total.count - cluster.inGO,
+                                                      other.clusters.total.count - 
+                                                        (GO.total.count - cluster.inGO)))  
+  
+  
+  fisher.test(contingency.table)$p.value
+  
+  return(data.frame(category = i,
+                    gene.count.in.coi = cluster.inGO,
+                    gene.count = GO.total.count,
+                    pval = fisher.test(contingency.table, alternative = 'greater')$p.value))
+} 
+
+#test the function
+clusters47.fisher.FUN("blood coagulation")
+
+
+# Same function for clusters 2 and 3
+
+clusters23.fisher.FUN <- function (i) {
+  fisher.data <- as.data.frame(alldeg.go.enrichment) %>% 
+    dplyr::filter(Description == i) %>% 
+    separate_rows(., geneID) %>% 
+    plyr::join(., 
+               lrt.plot.data %>% 
+                 rename('geneID' = 'symbol'),
+               by = "geneID", type = 'left',
+               match = 'first')
+  
+  
+  # total number of DEGs in clusters of interest
+  cluster.total.count = nrow(filter(lrt.plot.data,cluster %in% c(2,3)))/4
+  # total number of DEGs not in clusters of interest
+  other.clusters.total.count = nrow(lrt.plot.data)/4 - cluster.total.count
+  # number of DEGs in selected pathway belonging to clusters of interest
+  cluster.inGO = nrow(filter(fisher.data, cluster %in% c(2,3)))
+  # total number of DEGs in selected pathway
+  GO.total.count = fisher.data[1,]$Count
+  
+  
+  contingency.table <- data.frame("clusters23" = c(cluster.inGO,
+                                                   cluster.total.count - cluster.inGO),
+                                  "NOTclusters23" = c(GO.total.count - cluster.inGO,
+                                                      other.clusters.total.count - 
+                                                        (GO.total.count - cluster.inGO)))  
+  
+  
+  fisher.test(contingency.table)$p.value
+  
+  return(data.frame(category = i,
+                    gene.count.in.coi = cluster.inGO,
+                    gene.count = GO.total.count,
+                    pval = fisher.test(contingency.table, alternative = 'greater')$p.value))
+}
+
+
+
+clusters47.fisher.results <- map_df(as.list(as.data.frame(alldeg.go.enrichment.simplified)$Description),
+                                    .f = clusters47.fisher.FUN) %>% 
+  mutate(padj = p.adjust(.$pval, method = 'fdr'))
+
+
+clusters23.fisher.results <- map_df(as.list(as.data.frame(alldeg.go.enrichment.simplified)$Description),
+                                    .f = clusters23.fisher.FUN) %>% 
+  mutate(padj = p.adjust(.$pval, method = 'fdr'))
+```
+
+
+
+### Endothelial mediatiors
+```{r function for individual plots for endothelial mediators}
+
+
+# Function to extract gene of interest from zscores and plot
+# with p-value added to fig.
+# i represents gene_id, .x is the gene name
+
+mediator.fig.FUN <- function(i, .x) {
+  test <- zscores.individuals %>% 
+    filter(., gene_id == i) %>% 
+    mutate(gene_id = as.double(gene_id)) %>% 
+    left_join(.,results05, by = "gene_id") 
+  
+  pval = as.character(round(test$padj[1],3))
+  test$treatment <- factor(test$treatment, levels = c('control','low','medium','high'))
+
+  
+  ggplot(test, aes(treatment, zscore, color = treatment, 
+                   shape = treatment, fill = treatment)) +
+    scale_x_discrete(labels = c('C','0.10','0.90','7.22')) +
+    theme_classic(base_size = 10) +
+    theme(legend.position = 'none',
+          axis.title.x = element_text(size = 0),
+          axis.text = element_text(color = 'black'),
+          plot.title = element_text(hjust = 0.2, vjust = -1.5,
+                                    size = 10, color = 'grey20'),
+          plot.caption = element_text(hjust = 0.4,
+                                      vjust = 1,
+                                      color = 'grey30',
+                                      face = 'italic'),
+          axis.text.x = element_blank()) +
+    geom_jitter(width = 0.1, size = 1.2, 
+                alpha = 0.7, color = 'grey39') +
+    stat_summary(fun = mean, geom='crossbar', width = 0.5, size = 0.4) +
+    geom_errorbar(stat="summary", 
+                  fun.ymin=function(x) {mean(x)-sd(x)/sqrt(length(x))}, 
+                  fun.ymax=function(x) {mean(x)+sd(x)/sqrt(length(x))},
+                  width = 0.5) +
+
+    labs(title = .x,
+         caption = paste('p=',pval),
+         color = '',
+         fill = '',
+         shape = '') +
+    scale_y_continuous(breaks = seq(-2,2,2)) +
+    coord_cartesian(clip = 'off',
+                    ylim = c(-2.5,3)) +
+    scale_color_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3"),
+                       labels = issah.conc.labels) +
+    scale_fill_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3"),
+                      labels = issah.conc.labels) +
+    scale_shape_manual(values = c(21L,22L,23L,24L),
+                       labels = issah.conc.labels,
+                       guide = 'legend')
+}
+
+```
+
+```{r heatmaps of IFN and TGFb pathways}
+
+### IFN heatmap ####
+
+ifn.pathway.data <- as.data.frame(alldeg.go.enrichment.simplified) %>% 
+  dplyr::filter(Description %in% c('cellular response to interferon-gamma')) %>% 
+  separate_rows(., geneID) %>% 
+  left_join(., filter(lrt.plot.data, treatment == 'Control'), 
+            by = c('geneID' = 'symbol')) %>% 
+  distinct(geneID, .keep_all = T) %>% 
+  select(ID,Description,qvalue:value,cluster:ENTREZID) %>% 
+  mutate(gene_id = as.character(gene_id)) %>% 
+  left_join(., zscores.individuals, by = 'gene_id') %>% 
+  select(!ends_with(".y")) %>% 
+  mutate(pathway = 'ifny') %>% 
+  pivot_wider(values_from = c('zscore'),
+              names_from = 'geneID',
+              id_cols = c('treatment_id','treatment')) %>% 
+  column_to_rownames(var = 'treatment_id') 
+
+ifn.pathway.data$treatment <- factor(ifn.pathway.data$treatment,
+                                                   levels = c('control','low','medium','high'))
+
+
+# Manual row order to separate samples by treatment in splits
+
+row.order = c('C1','C2','C3','C4','C5','C6','C7','L1','L2','L3','L4','L5','L6',
+              'M1','M2','M3','M5','M6','M7','H1','H2','H3','H4','H5','H6',
+              'H7')
+
+
+# Colored annotation blocks for left side of heatmap to differentiate treatments
+
+ha.row = rowAnnotation(foo = anno_block(gp = gpar(fill = c(alpha("lightblue3",0.7),
+                                                           alpha("khaki3",0.7),
+                                                           alpha("darkgoldenrod2",0.7),
+                                                           alpha("orangered3",0.7))),
+                                        # labels = c('Control',
+                                        #            expression(paste('0.1 ',mu,'g/l',sep = "")),
+                                        #            expression(paste('0.9 ',mu,'g/l',sep = "")),
+                                        #            expression(paste('7.2 ',mu,'g/l',sep = ""))),
+                                        labels_gp = gpar(col = 'black',
+                                                         fontsize=0,
+                                                         fontface = 'bold'),
+                                        width = unit(0.4,'cm')))
+
+ifn.hm <- Heatmap(as.matrix(select(ifn.pathway.data, -treatment)),
+        name = 'scaled\nexpression',
+        col = colorRamp2(c(-2,0,2),c("cadetblue4","grey20","yellow")),
+        row_split = ifn.pathway.data$treatment,
+        row_order = row.order,
+        row_names_gp = gpar(fontsize = 0),
+        row_title_gp = gpar(fontsize=0),
+        row_title_rot = 0,
+        row_dend_reorder = F,
+        cluster_row_slices = F,
+        show_row_dend = F,
+        show_column_names = T,
+        column_names_rot = 45,
+        column_title_rot = 0,
+        column_title_gp = gpar(fontsize = 10),
+        show_column_dend = F,
+        column_gap = unit(0.5,'mm'),
+        row_gap = unit(0.8,'mm'),
+        border = T,
+        column_dend_reorder = F,
+        column_names_gp = gpar(fontsize = 5),
+        show_heatmap_legend = F,
+        left_annotation = ha.row,
+        column_title = expression(paste('IFN',gamma,sep = '')))
+
+ifn.hm
+
+  
+
+
+### TGF beta heatmap ####
+
+tgf.pathway.data <- as.data.frame(alldeg.go.enrichment.simplified) %>% 
+  dplyr::filter(Description %in% c('cellular response to transforming growth factor beta stimulus')) %>% 
+  separate_rows(., geneID) %>% 
+  left_join(., filter(lrt.plot.data, treatment == 'Control'), by = c('geneID' = 'symbol')) %>% 
+  distinct(geneID, .keep_all = T) %>% 
+  select(ID,Description,qvalue:value,cluster:ENTREZID) %>% 
+  mutate(gene_id = as.character(gene_id)) %>% 
+  left_join(., zscores.individuals, by = 'gene_id') %>% 
+  select(!ends_with(".y")) %>% 
+  pivot_wider(values_from = c('zscore'),
+              names_from = 'geneID',
+              id_cols = c('treatment_id','treatment')) %>% 
+  drop_na(treatment) %>% 
+  select(-ZNF451) %>% 
+  column_to_rownames(var = 'treatment_id') 
+
+tgf.pathway.data$treatment <- factor(tgf.pathway.data$treatment,
+                                                   levels = c('control','low','medium','high'))
+
+row.order = c('C1','C2','C3','C4','C5','C6','C7','L1','L2','L3','L4','L5','L6',
+              'M1','M2','M3','M5','M6','M7','H1','H2','H3','H4','H5','H6',
+              'H7')
+
+
+
+tgf.hm <- Heatmap(as.matrix(select(tgf.pathway.data, -treatment)),
+        name = 'scaled\nexpression',
+        col = colorRamp2(c(-2,0,2),c("cadetblue4","grey20","yellow")),
+        row_split = tgf.pathway.data$treatment,
+        row_order = row.order,
+        row_names_gp = gpar(fontsize = 0),
+        row_title_gp = gpar(fontsize= 0),
+        row_title_rot = 0,
+        row_dend_reorder = F,
+        cluster_row_slices = F,
+        show_row_dend = F,
+        show_column_names = T,
+        column_names_rot = 45,
+        column_title_rot = 0,
+        column_title_gp = gpar(fontsize = 10),
+        show_column_dend = F,
+        column_gap = unit(0.5,'mm'),
+        row_gap = unit(0.8,'mm'),
+        border = T,
+        column_dend_reorder = F,
+        column_names_gp = gpar(fontsize = 5),
+        #show_heatmap_legend = F,
+        column_title = expression(paste('TGF',beta,sep = '')),
+        heatmap_legend_param = list(
+                        #legend_direction = 'horizontal',
+                        title_gp = gpar(fontsize = 8),
+                        labels_gp = gpar(fontsize = 8),
+                        legend_width = unit(20,'mm'),
+                        legend_height = unit(1,'mm')))
+
+tgf.hm
+
+
+```
+
+```{r combine TGFb and IFN heatmaps into one figure}
+draw(ifn.hm + tgf.hm, heatmap_legend_side = 'right')
+
+mediators.hm = grid.grab(wrap.grobs = T)
+
+
+```
+
+### Final Figure 5 individual mediator plots and mediator pathways heatmap
+```{r generate completed figure 5}
+
+# Extract legend from a plot to use as shared legend
+
+fig5.row1.legend <- 
+  get_legend(
+    mediator.fig.FUN("109873854",expression(italic(vegfc))) +
+      guides(fill = 'none',
+             shape = guide_legend(nrow = 2,
+                                  override.aes = list(fill = c("lightblue3", "khaki3", "darkgoldenrod2", "orangered3"), 
+                                                      size = 3,
+                                                      alpha = 0.9)), 
+             color = 'none') +
+      theme(legend.position = 'top',
+            legend.key.size = unit(0.15, 'in'),
+            legend.text = element_text(size = 9)
+      ))
+
+
+# Create first row of plot
+
+fig5.row1 <- 
+  plot_grid(plot_grid(fig5.row1.legend,
+                      NULL,
+                      plot_grid(mediator.fig.FUN("109873854",expression(italic(vegfc))) +
+                                  theme(axis.title.y = element_text(size = 0)),
+                                mediator.fig.FUN("109885619",expression(italic(f2)))+
+                                  theme(#axis.line.y = element_blank(),
+                                    axis.text.y = element_blank(),
+                                    axis.title.y = element_blank(),
+                                    axis.ticks.y = element_blank()),
+                                nrow = 1,
+                                rel_widths = c(1,0.9)),
+                      ncol = 1,
+                      rel_heights = c(0.2,0.05,1)),
+            NULL,
+            mediators.hm,
+            rel_widths = c(0.4,0.05,1),
+            nrow = 1)
+
+# Create second row of plot
+
+fig5.row2 <- 
+  plot_grid(mediator.fig.FUN("109896202", expression(paste(italic('il1'),italic(beta))))+
+              theme(#axis.line.y = element_blank(),
+                #axis.text.y = element_blank(),
+                axis.title.y = element_blank()),
+            mediator.fig.FUN("109882167", expression(paste(italic('tnf'),italic(alpha))))+
+              theme(#axis.line.y = element_blank(),
+                axis.text.y = element_blank(),
+                axis.title.y = element_blank(),
+                axis.ticks.y = element_blank()),
+            # Leave NULL space to place panel C label
+            NULL,
+            mediator.fig.FUN("109898230",expression(italic('zo-1'))) +
+              theme(axis.text.y = element_blank(),
+                    axis.title.y = element_blank(),
+                    axis.ticks.y = element_blank()),
+            mediator.fig.FUN("109883845",expression(italic('zo-2')))+
+              theme(#axis.line.y = element_blank(),
+                axis.text.y = element_blank(),
+                axis.title.y = element_blank(),
+                axis.ticks.y = element_blank()),
+            mediator.fig.FUN("109885179", expression(paste(italic('occludin'))))+
+              theme(#axis.line.y = element_blank(),
+                axis.text.y = element_blank(),
+                axis.title.y = element_blank(),
+                axis.ticks.y = element_blank()
+              ),
+            mediator.fig.FUN("109873473", expression(paste(italic('jamc'))))+
+              theme(#axis.line.y = element_blank(),
+                axis.text.y = element_blank(),
+                axis.title.y = element_blank(),
+                axis.ticks.y = element_blank()),
+            NULL,
+            mediator.fig.FUN("109886327", expression(paste(italic('ve-cadherin'))))+
+              theme(#axis.line.y = element_blank(),
+                axis.text.y = element_blank(),
+                axis.title.y = element_blank(),
+                axis.ticks.y = element_blank()),
+            nrow = 1,
+            rel_widths = c(1,1,0.04,1,1,1,1,0.04,1))
+
+
+# Combine into final plot
+
+plot_grid(fig5.row1,
+          fig5.row2,
+          ncol = 1,
+          rel_heights = c(1,0.7)) +
+  draw_label('A', x = 0.02, y = .96, fontface = 'plain',
+             size = 11) +
+  draw_label('B', x = 0.3, y = .96, fontface = 'plain',
+             size = 11) +
+  draw_label('C', x = 0.28, y = .37, fontface = 'plain',
+             size = 11) +
+  draw_label('D', x = 0.85, y = .37, fontface = 'plain',
+             size = 11)
+
+
+
+```
+
+
+
+
+
+### Final Figure 6 blood-related pathways, cluster 2 and 3 developmental alterations
+
+```{r bubble plot of blood-related pathways}
+
+# Extract relevant GO terms and get cluster for each gene from lrt.plot.data
+
+blood.pathways.bubble.data <- as.data.frame(alldeg.go.enrichment.simplified) %>% 
+  clean_names() %>% 
+  filter(id %in% c('GO:0030198','GO:0007178','GO:0050819',
+                   'GO:0007599','GO:0050817','GO:0045766','GO:0042060')) %>%
+  separate_rows(., gene_id) %>% 
+  left_join(., filter(lrt.plot.data, treatment == 'Control'), by = c('gene_id' = 'symbol')) %>% 
+  drop_na(cluster)
+
+
+# Create df with the number of genes in each cluster for each pathways of interest
+
+blood.pathways.bubble.data <- 
+  map_df(unique(blood.pathways.bubble.data$description), function (i) {
+    data.frame(pathway = rep(i,7),
+               cluster = factor(seq(1:7)),
+               n = c(nrow(filter(blood.pathways.bubble.data, description == i, cluster == 1)),
+                     nrow(filter(blood.pathways.bubble.data, description == i, cluster == 2)),
+                     nrow(filter(blood.pathways.bubble.data, description == i, cluster == 3)),
+                     nrow(filter(blood.pathways.bubble.data, description == i, cluster == 4)),
+                     nrow(filter(blood.pathways.bubble.data, description == i, cluster == 5)),
+                     nrow(filter(blood.pathways.bubble.data, description == i, cluster == 6)),
+                     nrow(filter(blood.pathways.bubble.data, description == i, cluster == 7))))
+  })
+
+
+# Generate final bubble plot
+
+pathways.bubble.plot <- ggplot(blood.pathways.bubble.data, 
+                               aes(n,pathway, fill = cluster, 
+                                   color = cluster, size = n)) +
+  geom_point(color = 'black', aes(alpha = 0.6), shape = 21) +
+  theme_classic(base_size = 10) +
+  labs(x = 'DEG count',
+       y = '',
+       fill = 'Cluster') +
+  scale_size(range = c(3,8),
+             name = "# DE") +
+  guides(fill = guide_legend(title.position = 'top',
+                             title.hjust = 0.4,
+                             nrow = 1,
+                             override.aes = list(size = 4)),
+         size = 'none',
+         alpha = 'none') +
+  theme(axis.text = element_text(color = 'black'),
+        panel.grid.major.y = element_line(color = 'grey80'),
+        legend.position = c(0.1,1.11),
+        legend.key.height = unit(0.2,'cm'),
+        legend.key.width = unit (0.05,'cm'),
+        plot.margin = unit(c(3,0,0,-0.2), 'lines'),
+        legend.direction = 'horizontal',
+        legend.box = 'horizontal') +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.08)),
+                   labels = function(y) str_wrap(y,width = 30),
+                   position = 'left') +
+  scale_x_continuous(limits = c(0,45))
+
+
+```
+
+```{r ridgeline plot of developmental pathways in clusters 2 and 3}
+
+# GO terms related to development for ridgeline plot
+
+go.terms.zscores <- as.data.frame(clusters23.go.enrichment.simplified) %>% 
+  dplyr::filter(Description %in% c('ossification','blood vessel development',
+                                   'skeletal system development','epithelial cell proliferation',
+                                   'mesenchyme development','negative regulation of cell differentiation',
+                                   'response to wounding','embryonic organ development',
+                                   'transforming growth factor beta receptor signaling pathway')) %>% 
+  separate_rows(., geneID) %>% 
+  left_join(., clusters23.pathway.data, by = c('geneID' = 'symbol'))
+
+
+
+# Ridgeline plot
+
+ridgeline.plot <- ggplot(go.terms.zscores, aes(x = value, y = Description, fill = Description)) +
+  geom_density_ridges(scale =0.9,
+                      jittered_points = TRUE,
+                      position = position_points_jitter(width = 0.05, height = 0),
+                      point_shape = '|', point_size = 1.5, point_alpha = 1, alpha = 0.7,
+                      rel_min_height = 0.01) +
+  theme_ridges(center_axis_labels = T) +
+  scale_y_discrete(expand = expansion(mult = c(0.01, 0.15)),
+                   labels = function(y) str_wrap(y,width = 30),
+                   position = 'left') +
+  guides(fill = 'none') +
+  scale_x_continuous(limits = c(-2.3,2.6)) +
+  theme(legend.position = 'none',
+        axis.text.y= element_text(color = 'black', size = 8, vjust = 0,
+                                  lineheight = 0.8, hjust = 1),
+        axis.line = element_line(color = 'black',size = 0.5),
+        axis.title.x = element_text(size = 8,vjust = 2),
+        axis.text.x = element_text(size = 8),
+        plot.margin = unit(c(0,0,0,-0.7),'cm'),
+        axis.line.y = element_blank()) +
+  labs(y = "",
+       x = 'scaled expression') +
+  scale_fill_viridis(discrete = T) +
+  annotate('text',label = 'n = 37',x = 2.3, y = 8.6, size = 3.35,
+            fontface = 'italic', color = 'grey30') +
+  annotate('text',label = 'n = 27',x = 2.3, y = 7.55, size = 3.35,
+            fontface = 'italic', color = 'grey30') +
+  annotate('text',label = 'n = 36',x = 2.3, y = 6.5, size = 3.35,
+            fontface = 'italic', color = 'grey30') +
+  annotate('text',label = 'n = 34',x = 2.3, y = 5.5, size = 3.35,
+            fontface = 'italic', color = 'grey30') +
+  annotate('text',label = 'n = 24',x = 2.3, y = 4.5, size = 3.35,
+            fontface = 'italic', color = 'grey30') +
+  annotate('text',label = 'n = 29',x = 2.3, y = 3.4, size = 3.35,
+            fontface = 'italic', color = 'grey30') +
+  annotate('text',label = 'n = 36',x = 2.3, y = 2.3, size = 3.35,
+            fontface = 'italic', color = 'grey30') +
+  annotate('text',label = 'n = 49',x = 2.3, y = 1.3, size = 3.35,
+            fontface = 'italic', color = 'grey30')
+
+ridgeline.plot
+```
+
+```{r cnet plot for select developmental pathways}
+
+## First create gene list with fold change for coloring nodes
+
+gene_list <- clusters23.pathway.data$value
+names(gene_list) <- clusters23.pathway.data$symbol
+gene_list <- na.omit(gene_list)
+gene_list = sort(gene_list, decreasing = T)
+
+cnet <- cnetplot(clusters23.go.enrichment.simplified, 
+                 foldChange = gene_list, 
+                 ## choose relevant categories by row number
+                 showCategory = clusters23.go.enrichment.simplified$Description[c(3,4,7)], 
+                 cex_label_gene = 0.5,
+                 #cex_label_category = 0.9,  # label nodes below using geom_node_text instead
+                 node_label = 'gene',
+                 colorEdge = F) +  
+  scale_color_gradientn(colours = c('blue','black','orange'),
+                        name = 'scaled expression') 
+
+
+cnet <- cnet +   
+  theme(legend.position = 'none') +
+  geom_node_text(#label = cnet$data[2,3], # blood vessel development
+                 label = 'blood vessel\ndevelopment',
+                 data = cnet$data[2,], 
+                 fontface = 'bold.italic', size =3.5,
+                 color = 'red',
+                 hjust = -0.2,
+                 vjust = -0.2,
+                 lineheight = 0.7) +
+  geom_node_text(label = cnet$data[1,3], # ossification
+                 data = cnet$data[1,], 
+                 fontface = 'bold.italic', size =3.5,
+                 color = 'red',
+                 #hjust = 1,
+                 vjust = 1.5) +
+  geom_node_text(#label = cnet$data[3,3], # skeletal system development
+                 label = 'skeletal system\ndevelopment',
+                 data = cnet$data[3,], 
+                 fontface = 'bold.italic', size = 3.5,
+                 color = 'red',
+                 lineheight = 0.7,
+                 vjust = 1) #+
+  #annotate('segment', x = 1.5, xend = -2, y = -5.7, yend = -4.3, size = 1,
+  #         color = 'red')
+
+
+```
+
+```{r generate multi panel final figure 6}
+
+quartz(height = unit(6,'in'), width = unit(7,'in'))
+
+
+ggdraw() +
+  draw_plot(pathways.bubble.plot, x = 0, y = 0.5,
+            width = 0.5, height = 0.5) +
+  draw_plot(plot_grid(cnet), x = 0.55, y = 0,
+            width = 0.45) +
+  draw_plot(ridgeline.plot, x = 0, y = 0.02,
+            width = 0.49, height = 0.4) +
+  draw_label('A', x = 0.02, y = .96, fontface = 'plain',
+             size = 11) +
+  draw_label('B', x = 0.02, y = 0.43, fontface = 'plain',
+             size = 11) +
+  draw_label('C', x = 0.55, y = 0.96, fontface = 'plain',
+             size = 11) 
+
+```

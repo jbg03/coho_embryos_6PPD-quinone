@@ -1,0 +1,1090 @@
+---
+title: "6PDD-quinone embryos"
+author: "J Greer"
+date: "9/29/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+  
+<!-- Perform setup  -->
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, tidy = TRUE, message = FALSE,warning = FALSE)
+```
+
+```{r load packages, echo= FALSE}
+library(janitor)
+library(zoo)
+library(magick)
+library(colorspace)
+library(cowplot)
+library(FSA)
+library(DESeq2)
+library(DEGreport)
+library(ggvenn)
+library(ggforce)
+library(ggsci)
+library(circlize)
+library(readxl)
+library(lubridate)
+library(survival)
+library(survminer)
+library(scales)
+library(tidyverse)
+
+```
+
+### Experimental design
+
+```{r degree days experiment timeline, echo =FALSE, results=FALSE}
+# Calculate the total accumulated TUs for embryos using measured daily temperatures
+
+degree.days <- read_xlsx("../data/accumulated_tus.xlsx") %>% 
+  clean_names() %>% 
+  mutate(temp_c = as.numeric(temp_c),
+         hatchery=as.factor(hatchery)) %>% 
+  group_by(hatchery) %>% 
+  # Additive TUs in Celsius
+  mutate(total_tus = cumsum(temp_c),
+         days = case_when(hatchery == "Issaquah" ~ difftime(lubridate::ymd_hm(date),
+                                                            "2022-01-03 12:00",units = "days"),
+                          hatchery == "Yakima" ~ difftime(lubridate::ymd_hm(date),
+                                                          "2022-01-19 12:00", units = "days"))) %>% 
+  mutate(across(days,str_replace," days",""),
+         days = as.numeric(days)) %>% 
+  # Add column with arbitrary location for plotting expiermental design
+  mutate(y = 11.75)
+           
+
+```
+
+```{create experimental design plot}
+timeline.plot <- plot_grid(e1.design + theme(axis.text.x = element_blank(),
+                                             axis.line.x = element_blank(),
+                                             axis.ticks.x = element_blank(),
+                                             axis.title.x = element_blank()),
+                           NULL,
+                           e2.design, 
+                           ncol = 1,
+                           rel_heights = c(0.8,0.2,1),
+                           labels = c('A',''),
+                           label_fontface = 'plain',
+                           label_size = 11)
+```
+
+
+### Measured 6PPD-quinone concentrations
+
+```{r import data}
+concentration.data <- read_xlsx("../data/PPD_LCTR_Masterfile.xlsx",
+                                sheet = "LCTR") %>% 
+  clean_names() %>% 
+  rename('conc' = 9) %>% 
+  select(4:9)
+  
+```
+
+```{r mean initial concentrations issaquah Experiment 1}
+
+## Find mean initial concentrations 
+
+issah.inital.conc <- concentration.data %>% 
+  drop_na(site_id) %>% 
+  # Filter for samples from Issaquah exposures and initial values only
+  filter(collection_date < lubridate::ymd('2022-01-20'),
+         str_detect(site_id,"initial")) %>% 
+  dplyr::mutate(site_id = str_replace(site_id,"\\wg/L-initia.+",""),
+                site_id = str_replace(site_id,"-init.+",''),
+                conc = str_replace(conc,'<0.002','0'),
+                conc = as.numeric(conc)) %>% 
+  rename('nominal_conc' = 'site_id') %>% 
+  group_by(nominal_conc) %>% 
+  summarise(mean = mean(conc))
+
+
+# All Experiment 1 data, find mean of duplicates and prepare data frame for plotting
+
+issah.concentrations <- concentration.data %>% 
+  # Remove random blank rows
+  drop_na(site_id) %>%  
+  # Filter for samples from Issaquah exposures 
+  filter(collection_date < lubridate::ymd('2022-01-20')) %>% 
+  rename('nominal_conc' = 'site_id') %>% 
+  dplyr::mutate(nominal_conc = tolower(nominal_conc),
+                # Add new column stating if measurement was initial or final
+                type = case_when(
+                  str_detect(nominal_conc,"initial") ~ "initial",
+                  str_detect(nominal_conc,"final") ~ "final"),
+                nominal_conc = str_replace(nominal_conc,"control.+","control"),
+                nominal_conc =str_replace(nominal_conc,"100ng.+","0.1"),
+                nominal_conc =str_replace(nominal_conc,"1ug.+","1.0"),
+                nominal_conc =str_replace(nominal_conc,"10ug.+","10"),
+                conc = str_replace(conc,'<0.002','0'),
+                conc = as.numeric(conc)) %>% 
+  # Remove controls, no need to plot them
+  filter(!nominal_conc == "control") %>% 
+  # Final the mean of the duplicate measurements
+  group_by(nominal_conc, collection_date, type) %>%
+    summarise(mean = mean(conc)) %>% 
+  dplyr::mutate(exposure = case_when(
+    str_detect(collection_date, '2022-01-1[0-1]') ~ 'exposure 2',
+    str_detect(collection_date, '2022-01-13') ~ 'exposure 3',
+    str_detect(collection_date, '2022-01-1[7-8]') ~ 'exposure 4'))
+
+
+## Add dummy rows for missing final concentration from exposure 3
+
+dummy.rows <- data.frame(nominal_conc = c('0.1','1.0','10'),
+                         type = 'final',
+                         mean = 0,
+                         exposure = 'exposure 3')
+
+issah.concentrations <- bind_rows(issah.concentrations,dummy.rows)
+
+issah.concentrations$type <- factor(issah.concentrations$type, levels = c('initial','final'))
+
+```
+
+```{r generate plots for Experiment 1 water chemistry}
+
+# Create labels for ggplot from calculated mean initial concentrations
+
+issah.conc.labels <-c("Control",bquote(paste("0.1 ",mu,"g/L")),bquote(paste("0.90 ",mu,"g/L")),
+                                bquote(paste("7.22 ",mu,"g/L")))
+
+
+# Final plots for each concentration from Experiment 1
+
+# 10 ug/L plot #### 
+
+issah.concentration.plot.10ug <- 
+ggplot() +
+  geom_col(filter(issah.concentrations, nominal_conc == '10'),
+           mapping = aes(x = exposure, y = mean, group = type,
+                         fill = type),
+           position = position_dodge(width = 0.7),
+           width = 0.35, 
+           color = 'black',
+           size = 0.35) +
+  scale_y_continuous(expand = expansion(c(0,0))) +
+  theme_classic(base_size = 9.5) +
+  labs(x = '',
+       y = bquote(paste('conc (',mu,'g/L)')),
+       fill = '') +
+  theme(axis.text = element_text(color = 'black'),
+        axis.text.x = element_text(angle = 30, vjust = 0.65),
+        legend.position = 'none',
+        axis.title.y = element_text(size = 9, vjust=-1),
+        plot.title = element_text(size = 8, color = 'grey30'),
+        plot.margin = unit(c(0.33, 0, -0.5, 0), 'cm'))+
+  scale_fill_manual(values = alpha(c("orangered3","orangered3"),c(0.8,0.4))) +
+  annotate('text', x = 2.2, y = 1.0, label = 'ND', size = 3.0) +
+  annotate('segment', x = 0.85, xend = 0.85, y = 7, yend = 7.6) +
+  annotate('segment', x = 0.85, xend = 1.15, y = 7.6, yend = 7.6) +
+  annotate('segment', x =1.15, xend = 1.15, y = 6.2, yend = 7.6) +
+  annotate('text', x = 1, y = 8.6, label = '15.6%', size = 2.8) +
+  annotate('segment', x = 2.85, xend = 2.85, y = 8.4, yend = 9.0) +
+  annotate('segment', x = 2.85, xend = 3.15, y = 9.0, yend = 9.0) +
+  annotate('segment', x =3.15, xend = 3.15, y = 9.0, yend = 3.2) +
+  annotate('text', x = 3.05, y = 10, label = '66.6%', size = 2.8) +
+  annotate('text', fontface = 'italic',
+           x = 1.8, y = 13, size = 3, 
+           label = expression(paste(italic("mean initial: "), italic("7.22 "),italic(mu),italic("g/L"))),
+           vjust = 1.5, color = 'grey35', parse = T) +
+  coord_cartesian(ylim = c(0,12), clip = 'off')
+ 
+
+# 1 ug/L final plot ####
+
+issah.concentration.plot.1ug <- 
+ggplot() +
+  geom_col(filter(issah.concentrations, nominal_conc == '1.0'),
+           mapping = aes(x = exposure, y = mean, group = type,
+                         fill = type),
+           position = position_dodge(width = 0.7),
+           width = 0.35, 
+           color = 'black',
+           size = 0.35) +
+  scale_y_continuous(expand = expansion(c(0,0))) +
+  theme_classic(base_size = 9.5) +
+  labs(x = '',
+       y = bquote(paste('conc (',mu,'g/L)')),
+       fill = '') +
+  theme(axis.text = element_text(color = 'black'),
+        axis.text.x = element_text(angle = 30, vjust = 0.65),
+        legend.position = 'none',
+        axis.title.y = element_text(size = 9, vjust=-1),
+        plot.title = element_text(size = 8, color = 'grey30'),
+        plot.margin = unit(c(0.33, 0, -0.5, 0), 'cm'))+
+  scale_fill_manual(values = alpha(c("darkgoldenrod2","darkgoldenrod2"),c(0.8,0.3))) +
+  annotate('text', x = 2.2, y = 0.1, label = 'ND', size = 3) +
+  annotate('segment', x = 0.85, xend = 0.85, y = 0.73, yend = 0.77) +
+  annotate('segment', x = 0.85, xend = 1.15, y = 0.77, yend = 0.77) +
+  annotate('segment', x =1.15, xend = 1.15, y = 0.77, yend = 0.71) +
+  annotate('text', x = 1, y = 0.90, label = '5.4%', size = 2.8) +
+  annotate('segment', x = 2.85, xend = 2.85, y = 1.1, yend = 1.15) +
+  annotate('segment', x = 2.85, xend = 3.15, y = 1.15, yend = 1.15) +
+  annotate('segment', x =3.15, xend = 3.15, y = 1.15, yend = 0.35) +
+  annotate('text', x = 3.05, y = 1.25, label = '74.1%', size = 2.8) +
+  annotate('text', fontface = 'italic',
+           x = 1.8, y = 1.65, size = 3, 
+           label = expression(paste(italic("mean initial: "), italic("0.90 "),italic(mu),italic("g/L"))),
+           vjust = 1.5, color = 'grey35', parse = T) +
+coord_cartesian(ylim = c(0,1.5), clip = 'off')
+
+
+# 0.1 ug/L final plot ####
+
+issah.concentration.plot.100ng <- 
+ggplot() +
+  geom_col(filter(issah.concentrations, nominal_conc == '0.1'),
+           mapping = aes(x = exposure, y = mean, group = type,
+                         fill = type),
+           position = position_dodge(width = 0.7),
+           width = 0.35, 
+           color = 'black',
+           size = 0.35) +
+  scale_y_continuous(expand = expansion(c(0,0))) +
+  theme_classic(base_size = 9.5) +
+  labs(x = '',
+       y = bquote(paste('conc (',mu,'g/L)')),
+       fill = '') +
+  theme(axis.text = element_text(color = 'black'),
+        axis.text.x = element_text(angle = 30, vjust = 0.65),
+        legend.position = 'none',
+        axis.title.y = element_text(size = 9, vjust=-0.5),
+        plot.title = element_text(size = 8, color = 'grey30'),
+        plot.margin = unit(c(0.33, 0, -1, 0), 'cm'))+
+  scale_fill_manual(values = alpha(c("khaki3","khaki3"),c(0.8,0.3))) +
+  annotate('text', x = 2.2, y = 0.015, label = 'ND', size = 3) +
+  annotate('segment', x = 0.85, xend = 0.85, y = 0.09, yend = 0.10) +
+  annotate('segment', x = 0.85, xend = 1.15, y = 0.10, yend = 0.10) +
+  annotate('segment', x =1.15, xend = 1.15, y = 0.10, yend = 0.07) +
+  annotate('text', x = 1, y = 0.115, label = '27.1%', size = 2.8) +
+  annotate('segment', x = 2.85, xend = 2.85, y = 0.12, yend = 0.13) +
+  annotate('segment', x = 2.85, xend = 3.15, y = 0.13, yend = 0.13) +
+  annotate('segment', x =3.15, xend = 3.15, y = 0.13, yend = 0.05) +
+  annotate('text', x = 3.05, y = 0.15, label = '64.8%', size = 2.8) +
+  annotate('text', fontface = 'italic',
+           x = 1.8, y = 0.2, size = 3, 
+           label = expression(paste(italic("mean initial: "), italic("0.10 "),italic(mu),italic("g/L"))),
+           vjust = 1.5, color = 'grey35', parse = T) +
+coord_cartesian(ylim = c(0,0.18), clip = 'off')
+
+
+```
+
+```{r mean initial concentrations yakima Experiment 2}
+
+# Find mean of technical replicates and prepare dataframe for plotting
+
+yakima.inital.conc <- concentration.data %>% 
+  drop_na(site_id) %>% 
+  filter(collection_date > lubridate::ymd('2022-01-20')) %>%# from yakima exposures
+  rename('nominal_conc' = 'site_id') %>% 
+  dplyr::mutate(nominal_conc = str_replace(nominal_conc,"\\wg/L",""),
+                nominal_conc = str_replace(nominal_conc," ",""),
+                conc = str_replace(conc,'<0.002','0'),
+                nominal_conc = str_replace(nominal_conc, "100",'0.1'),
+                timepoint_post_spike = str_replace(site_location, "TP (\\d)-\\d",'\\1'),
+                conc = as.numeric(conc),
+                hours_post_spike = case_when(timepoint_post_spike == 1 ~ 0,
+                                             timepoint_post_spike == 2 ~ 2,
+                                             timepoint_post_spike == 3 ~ 4,
+                                             timepoint_post_spike == 4 ~ 8,
+                                             timepoint_post_spike == 5 ~ 12,
+                                             timepoint_post_spike == 6 ~ 18,
+                                             timepoint_post_spike == 7 ~ 24)) %>%
+  group_by(nominal_conc, hours_post_spike)
+
+
+
+
+
+
+```
+
+```{r generate plot for Experiment 2 water chemistry}
+
+yakima.conc.single.plot <- ggplot(filter(yakima.inital.conc, !nominal_conc == 'Control'),
+       aes(hours_post_spike, conc, color = nominal_conc, shape = nominal_conc)) +
+  geom_point(color = 'grey30', size = 1.8) +
+  theme_classic(base_size = 9.5) +
+  theme(strip.background = element_blank(),
+        legend.position = 'none',
+        axis.text = element_text(color = 'black'),
+        axis.line = element_line(size = 0.4),
+        axis.title.y = element_text(vjust = -1, size = 9),
+        axis.title.x = element_text(size = 9),
+        plot.margin = unit(c(0, 0, 0, 0.5), 'cm')) +
+  stat_summary(aes(group = nominal_conc), 
+               fun = mean, 
+               geom = 'line',
+               size = 1,
+               alpha = 0.8) +
+  scale_y_continuous(limits = c(0,NA),
+                     expand = expansion(c(0,0.25)),
+                     labels = scales::label_number(accuracy = 0.1),
+                     trans=scales::pseudo_log_trans(base = 10)
+  ) +
+  labs(y = expression(paste('log'[10], ' conc (',mu,'g/L)')),
+       x = 'time post-spike (h)') +
+  scale_color_manual(values = c("khaki3","darkgoldenrod2","orangered3")) +
+  scale_x_continuous(breaks = seq(0,24,6)) +
+  scale_shape_manual(values = c(21L,22L,24L))
+
+
+```
+
+```{r create concentration plot labels}
+issah.conc.labels <-c("Control",bquote(paste("0.1 ",mu,"g/L")),bquote(paste("0.90 ",mu,"g/L")),
+                                bquote(paste("7.22 ",mu,"g/L")))
+
+yakima.conc.labels <- c("Control", bquote(paste("0.07 ",mu,"g/L")),bquote(paste("0.86 ",mu,"g/L")),
+                                bquote(paste("6.04 ",mu,"g/L")))
+
+
+```
+
+```{r cowplot paneled figure all concentration data}
+
+# Four panel final plot ####
+quartz(height = unit(3.5,'in'), width = unit(4.5,'in'))
+
+chemistry_plot <-  plot_grid(plot_grid(issah.concentration.plot.100ng + 
+                      theme(plot.margin = unit(c(0.5, 0, -50, 1), 'lines')),
+                    NULL,
+                    issah.concentration.plot.1ug + 
+                      theme(plot.margin = unit(c(0.5, 0, 0, 1), 'lines')),
+                    nrow = 1,
+                    rel_widths = c(1,0.05,1),
+                    labels = c('B','','C'),
+                    label_size = 11,
+                    label_fontface = 'plain',
+                    align = 'hv'),
+          plot_grid(issah.concentration.plot.10ug + 
+                      theme(plot.margin = unit(c(0.5, 0, 0, 1), 'lines')),
+                    NULL,
+                    yakima.conc.single.plot + 
+                      theme(axis.title.x = element_text(vjust = 9)),
+                    rel_widths = c(1,0.05,1),
+                    nrow = 1,
+                    labels = c('D','','E'),
+                    label_size = 11,
+                    label_fontface = 'plain',
+                    align = 'h'
+          ),
+          nrow = 2)
+  
+
+
+```
+
+
+### Final Figure 1 experimental design and measured 6PPD-quinone concentrations
+
+```{r final figure 1}
+
+quartz(height = unit(5,'in'), width = unit(4.5,'in'))
+
+plot_grid(timeline.plot,
+          NULL,
+          chemistry_plot,
+          ncol = 1,
+          rel_heights = c(1.9,0.1,3.5))
+
+
+```
+
+
+### Mortality and hatching
+
+```{r Issaquah morality analysis and plot}
+
+# Import survival data for Experiment 1 
+
+issah.survdat <- read_xlsx("../data/embryo_mortality.xlsx") %>% 
+  clean_names() %>% 
+  filter(hatchery == "issaquah") %>% 
+  mutate(time = as.numeric(difftime(lubridate::ymd(date_of_event),
+                                    lubridate::ymd("2022-01-05")), 
+                           units = "days"),
+         censored = as.numeric(censored))
+
+
+# Fit the data 
+
+issah.fit <- survival::survfit(Surv(time = issah.survdat$time, 
+                                    event = issah.survdat$censored) ~ treatment, 
+                               data = issah.survdat)
+
+
+# Plot survival fit 
+
+issah.km.ggsurv <- ggsurvplot(fit = issah.fit,
+                              pval = F,
+                              conf.int = F, 
+                              palette = alpha(c("lightblue3","khaki3","darkgoldenrod2","orangered3"), c(0.6,0.6,0.6,0.6)),
+                              size.est = 0.5,
+                              #risk.table = T
+                              ) 
+
+## df for adding plot points of exposure days to mortality
+exposure.df.issah <- data.frame(day = c(2,5,8,12),
+                                surv = c(1,1,1,1))
+
+
+## Create custom ggplot starting with ggsurvplot 
+
+issah.km.plot <- issah.km.ggsurv$plot +
+  theme_classic() +
+  scale_x_continuous(expand = expansion(mult = c(0,0.1))) +
+  scale_y_continuous(labels = function(x) paste0(x*100),
+                     expand = c(0.,0.05)) +
+  theme_classic(base_size = 9.5) +
+  labs(x="day",
+       color = "",
+       fill="",
+       y = '% survival') +
+  scale_color_manual(breaks=c("treatment=control",
+                              "treatment=low",
+                              "treatment=med",
+                              "treatment=high"),
+                     labels = issah.conc.labels,
+                     values = alpha(c("#264653",
+                                      "#E9C46A",
+                                      "#2A9D8F",
+                                      "#E76F51"),
+                                    c(0.9,0.9,0.9,0.9))) +
+  theme(axis.text = element_text(color = "black"),
+        axis.title.y = element_text(vjust = 0, size = 9),
+        legend.position = 'none',
+        legend.background = element_blank(),
+        axis.line = element_line(size = 0.4),
+        plot.margin = unit(c(0, 0, 0, 0.2), 'cm')) +
+  coord_cartesian(xlim = c(0,22)) +
+  annotate('text',label = surv_pvalue(issah.fit)$pval.txt, 
+           x= 7, y = 0.04, size = 3,
+           fontface = 'italic', color = 'grey20') +
+  geom_point(data=exposure.df.issah, color = 'grey55', 
+             aes(x = day, y = surv), 
+             size =2.7, shape = 21, fill = 'grey70') +
+  annotate('text', label = expression(paste("7.22 ",mu,"g/L")),
+           x = 19.5, y = 0.35, color = "#E76F51", 
+           size = 3, fontface = 'bold') +
+  annotate('text', label = expression(paste("0.90 ",mu,"g/L")), x = 19.5,
+           y = 0.67, color = "#2A9D8F", size = 3, fontface = 'bold')
+
+```
+
+Is 0.90 ug/L significantly different from controls in Experiment 1?
+
+```{r}
+
+# Import data for only control and medium to caluclate p-value
+
+issah.survdat <- filter(issah.survdat, treatment %in% c('control','med'))
+
+issah.fit <- survfit(Surv(time = issah.survdat$time, 
+                          event = issah.survdat$censored) ~ treatment, 
+                     data = issah.survdat)
+
+### Ad-hoc interested in 3 comparisons: each treatment vs control
+### Therefore BH correction with k=3 
+
+print(surv_pvalue(issah.fit)$pval * 3)
+
+```
+
+```{r Yakima mortality analysis and plot}
+
+# Import survival data for Experiment 2
+
+yakima.survdat <- read_xlsx("../data/embryo_mortality.xlsx") %>% 
+  clean_names() %>% 
+  filter(hatchery == "yakima") %>% 
+  mutate(time = as.numeric(difftime(lubridate::ymd(date_of_event),
+                                    lubridate::ymd("2022-01-23")),
+                           units = "days"),
+         censored = as.numeric(censored))
+
+
+# Fit the data
+
+yakima.fit <- survfit(Surv(time = yakima.survdat$time, 
+                           event = yakima.survdat$censored) ~ treatment, 
+                      data = yakima.survdat)
+
+# Plot survival fit
+
+yakima.km.ggsurv <- ggsurvplot(fit = yakima.fit, 
+                               pval = F, 
+                               conf.int = F,
+                               size.est = 0.5
+                               #risk.table = T
+)
+
+## Df  for adding plot points of exposure days to mortality
+
+exposure.df.yakima <- data.frame(day = 2,
+                                 surv = 1)
+
+
+## Create custom ggplot starting with ggsurvplot 
+
+yakima.km.plot <- yakima.km.ggsurv$plot +
+  theme_classic() +
+  scale_x_continuous(expand = expansion(mult = c(0,0.1))) +
+  scale_y_continuous(labels = function(x) paste0(x*100),
+                     expand = c(0,0.05)) +
+  theme_classic(base_size = 10) +
+  labs(x="day",
+       color = "",
+       fill="",
+       y = '% survival') +
+  scale_color_manual(breaks = c("treatment=control",
+                                "treatment=low",
+                                "treatment=med",
+                                "treatment=high"),
+                     labels = yakima.conc.labels,
+                     values = c("#264653","#E9C46A","#2A9D8F","#E76F51")) +
+  theme(axis.text = element_text(color = "black"),
+        axis.title.y = element_text(vjust = 0, size = 9),
+        legend.position = 'none',
+        legend.background = element_blank(),
+        axis.line = element_line(size = 0.4),
+        plot.margin = unit(c(0.1, 0, 0, 0.2), 'cm')) +
+  coord_cartesian(xlim = c(0,22)) +
+  annotate('text', label = surv_pvalue(yakima.fit)$pval.txt, 
+           x= 7, y = 0.04, size = 3,
+           fontface = 'italic', color = 'grey20') +
+  geom_point(data=exposure.df.yakima,color = 'grey55', aes(x = day, y = surv), 
+             size =2.5, shape = 21,fill = 'grey70') +
+  annotate('text', label = expression(paste("6.04 ",mu,"g/L")), x = 19.5,
+           y = 0.25, color = "#E76F51", size = 3, fontface = 'bold')
+
+```
+
+```{r hatching}
+hatch.FUN <- function (i) {
+  hatch.data <- read_xlsx(paste0("data/",i,' Coho Embryo 6PPD-Q Exposure Spreadsheet.xlsx'),
+                                    sheet = "Totals Daily - Proportion Alive") %>%
+  clean_names() %>%
+  arrange(date)
+  
+  n = hatch.data$control[[10]]
+  
+  hatch.data <- hatch.data %>% 
+    filter(condition == "hatched alive") %>%
+    dplyr::select(-condition) %>% 
+    pivot_longer(cols = -date,
+                 names_to = 'treatment',
+                 values_to = 'number_hatched') %>%
+    mutate(
+      proportion_hatched = (number_hatched / n) * 100,
+      day = as.numeric(
+        difftime(lubridate::ymd(date),
+                 lubridate::ymd(min(.$date)),
+                 units = "days"
+         )))
+  
+  ggplot(hatch.data,aes(x=day,y=proportion_hatched,color=treatment)) +
+  #geom_point(size=1) +
+  theme_classic() +
+  geom_line(size = 1) +
+  scale_x_continuous(expand = expansion(mult = c(0,0.1)),
+                     breaks = seq(0,19,5)) +
+  scale_y_continuous(limits = c(0,100)) +
+  theme_classic(base_size = 10) +
+  theme(axis.text = element_text(color = "black"),
+        axis.title.y = element_text(vjust = 0),
+        legend.position = 'top',
+        legend.background = element_blank(),
+        axis.line = element_line(size = 0.6),
+        plot.margin = unit(c(0, 0, 0, 0.6), 'cm')) +
+  labs(x="day",
+       y="% hatched and alive",
+       color = "") +
+  scale_color_manual(breaks=c("control","low","med","high"),
+                     labels = issah.conc.labels,
+                     values = c("#264653","#E9C46A","#2A9D8F","#E76F51")) +
+  coord_cartesian(xlim = c(0,19))
+}
+
+hatch.plots <- map(c('Issaquah','Yakima'), hatch.FUN)
+
+hatch.plots[[1]]
+hatch.plots[[2]]
+```
+
+```{r import mortality phenotypes}
+
+# Experiment 1 phenotypes
+
+issah.phenotypes <- read_xlsx("../data/embryo_mortality.xlsx") %>% 
+  clean_names() %>% 
+  filter(hatchery == "issaquah") %>% 
+  mutate(time = as.numeric(difftime(lubridate::ymd(date_of_event),
+                                    lubridate::ymd("2022-01-05")),
+                           units = "days"),
+         censored = as.numeric(censored)) %>% 
+  filter(notes %in% c('head_out','protruding'))
+
+
+# Experiment 2 phenotypes
+
+yakima.phenotypes <- read_xlsx("../data/embryo_mortality.xlsx") %>% 
+  clean_names() %>% 
+  filter(hatchery == "yakima") %>% 
+  mutate(time = as.numeric(difftime(lubridate::ymd(date_of_event),
+                                    lubridate::ymd('2022-01-23')),
+                           units = "days"),
+         censored = as.numeric(censored)) %>% 
+  filter(notes %in% c('head_out','protruding'))
+```
+
+```{r density plots of mortality phenotypes}
+
+# Dataframe calculating the percentages for each phenotype to add to plots
+
+data.frame(hatchery = c('Issaquah','Yakima'),
+           n_mortalities = c(91,51),
+           protruding_n = c(nrow(filter(issah.phenotypes,notes == 'protruding')),
+                            nrow(filter(yakima.phenotypes,notes == 'protruding'))),
+           head_out_n = c(nrow(filter(issah.phenotypes,notes == 'head_out')),
+                          nrow(filter(yakima.phenotypes,notes == 'head_out')))) %>% 
+  mutate(protruding_percent = protruding_n / n_mortalities,
+         head_out_percent = head_out_n / n_mortalities)
+
+
+# Plot Experiment 1 
+
+issah.phenotype.plot <- ggplot(issah.phenotypes,
+                               aes(x = time, fill = notes, color = notes)) +
+  geom_density(alpha = 0.4) +
+  theme_classic(base_size = 9.5) +
+  scale_y_continuous(expand = c(0,0),
+                     breaks = seq(0,0.2,0.1)) +
+  scale_x_continuous(limits = c(0,25),
+                     breaks = seq(0,20,10)) +
+  labs(x = 'day',
+       fill = '',
+       y = 'density') +
+  scale_fill_manual(labels = c('Partial hatch','Protruding yolk'),
+                    values = c('darkslategrey','goldenrod')) +
+  theme(legend.key.size = unit(0.4,'cm'),
+        axis.line = element_line(size = 0.4),
+        axis.text = element_text(color = "black"),
+        plot.margin = unit(c(0, 0, 0, 0), 'cm'),
+        legend.position = 'none') +
+  annotate("segment", x = 13, y = 0.12, xend = 13, yend = 0.05, 
+           size = 1, linejoin = "mitre", color = "black",
+           arrow = arrow(type = "closed", length = unit(0.005,"npc"))) +
+  scale_color_manual(values = c('darkslategrey','goldenrod')) +
+  annotate('text', label = 'n= 34 (37%)', color = 'darkslategrey', x = 22.5,
+           y = 0.2, size = 2.9) +
+  annotate('text', label = 'n= 40 (44%)', color = 'goldenrod3', x = 22.5,
+           y = 0.17, size = 2.9) +
+  coord_cartesian(clip = 'off', xlim = c(0,30))
+
+
+# Plot Experiment 2
+
+yakima.phenotype.plot <- ggplot(yakima.phenotypes,
+                                aes(x = time, fill = notes, color = notes)) +
+  geom_density(alpha = 0.4) +
+  theme_classic(base_size = 9.5) +
+  scale_y_continuous(expand = c(0,0),
+                     breaks = seq(0,0.3,0.1)) +
+  scale_x_continuous(limits = c(0,25),
+                     breaks = seq(0,20,10)) +
+  labs(x = 'day',
+       fill = '',
+       y = 'density') +
+  scale_fill_manual(labels = c('Partial hatch','Protruding yolk'),
+                    values = c('darkslategrey','goldenrod')) +
+  theme(legend.key.size = unit(0.4,'cm'),
+        axis.line = element_line(size = 0.4),
+        axis.text = element_text(color = "black"),
+        plot.margin = unit(c(0, 0, 0, 0), 'cm'),
+        legend.position = 'none') +
+  annotate("segment", x = 13, y = 0.12, xend = 13, yend = 0.05, 
+           size = 1, linejoin = "mitre", color = "black",
+           arrow = arrow(type = "closed", length = unit(0.005,"npc"))) +
+  scale_color_manual(values = c('darkslategrey','goldenrod')) +
+  annotate('text', label = 'n= 18 (35%)', color = 'darkslategrey', x = 19.5,
+           y = 0.29, size = 2.9) +
+  annotate('text', label = 'n= 24 (47%)', color = 'goldenrod', x = 19.5,
+           y = 0.25, size = 2.9) +
+  coord_cartesian(clip = 'off',xlim = c(0,30))
+
+
+# arrow indicates primary day of hatching for control and lower dose exposures
+ 
+
+```
+
+### Final Figure 2 mortality and phenotypes
+```{r Final Fig 2 mortality and phenotypes}
+
+# Import phentype example images
+
+protruding.pheno.image1 <- magick::image_read("../data/PXL_20220114_224131152.MP.jpg",
+                                             density = 2000) %>% 
+  image_scale("400") %>% 
+  image_crop("135x90+220+54")
+
+
+
+protruding.pheno.image2 <- magick::image_read("../data/PXL_20220113_211007934.MP.jpg",
+                                              density = 2000) %>% 
+  image_scale("700") %>% 
+  image_modulate(brightness = 180) %>% 
+  image_crop("120x90+258+486")
+
+
+# Create row 1 with Kaplen-Meier survival curves
+
+fig2.row1 <- plot_grid(issah.km.plot + 
+                         theme(plot.margin = unit(c(0, 0, 0, 0.5), 'cm')),
+                       NULL,
+                       yakima.km.plot + 
+                         theme(plot.margin = unit(c(0, 0, 0, 0.5), 'cm')),
+                       nrow = 1,
+                       rel_widths = c(1,0.12,1),
+                       align = 'hv',
+                       labels = c("A","","B"),
+                       label_fontface = 'plain',
+                       label_size = 11)
+
+
+
+# Density plots of phentypes for row 2 with legend
+
+pheno.legend <- get_legend(
+  issah.phenotype.plot +
+    guides(color = "none") +
+    theme(legend.position = 'top',
+          #legend.key.width = unit(0.1,'in'),
+          legend.text = element_text(size = 9)))
+
+
+fig2.density <- plot_grid(pheno.legend,
+                          plot_grid(issah.phenotype.plot + 
+                            theme(plot.margin = unit(c(0, 0, 0, 0.5), 'cm')),
+                          NULL,
+                          yakima.phenotype.plot + 
+                            theme(plot.margin = unit(c(0, 0, 0, 0.5), 'cm')),
+                          nrow = 1,
+                          rel_widths = c(1,0.1,1),
+                          labels = c("D","","E"),
+                          label_fontface = 'plain',
+                          label_size = 11,
+                          align = 'hv'),
+                          ncol = 1,
+                          rel_heights = c(0.2,1))
+
+
+# Complete row 2 by adding images
+
+fig2.row2 <- plot_grid(ggdraw(plot_grid(NULL,
+                           fig2.density,
+                           rel_widths = c(0.5,1),
+                           labels = c("C",""),
+                           label_fontface = 'plain',
+                           label_size = 11) +
+            draw_image(protruding.pheno.image1,
+                       x = 0.07, y = 0.35,
+                       width = 0.22,
+                       height = 1) +
+            draw_image(protruding.pheno.image2,
+                       x = 0.07, y = -0.20,
+                       width = 0.22,
+                       height = 1)))
+
+
+# Plot final Figure 2
+
+quartz(height = unit(3.2,'in'), width = unit(5,'in'))
+plot_grid(fig2.row1,
+          NULL,
+          fig2.row2,
+          ncol = 1,
+          rel_heights = c(1,0.2,1))
+
+```
+
+
+### Morphology
+```{r load Experiment 1 morphology data}
+
+morph.data <- read_xlsx("../data/Coho Larvae Measurements_Issaquah.xlsx") %>% 
+  clean_names %>% 
+  mutate(treatment = as.factor(treatment)) %>% 
+  rename_with(~str_replace(., "_um_ed", "")) %>% 
+  rename_with(~str_replace(., "_square", "")) %>% 
+  mutate(across(.cols = c('eye_area','yolk_area','total_length'), ~ . / 1000))
+
+morph.data$treatment <- factor(morph.data$treatment, 
+                               levels = c('Control', 'Low', 'Medium', 'High'))
+
+```
+
+```{r ANOVA and Kruskal-Wallace tests for sigificance}
+
+# Function to determine normality and perform appropriate test
+
+morph.stats.FUN <- function (i, .x) {
+  data <- morph.data %>% 
+    filter(!is.na(i),
+           days_post_hatch == .x)
+  
+  shapiro.p <- shapiro.test(data[[i]])$p.value
+  
+  if(shapiro.p > 0.05) {
+    test = 'ANOVA'
+    aov <- aov(data[[i]] ~ treatment, data = data)
+    anova.p <- summary(aov)[[1]][[1,5]] # extract p-value from ANOVA
+    post.hoc <- TukeyHSD(aov)
+    post.hoc <- as.data.frame(post.hoc$treatment) %>% 
+      rownames_to_column(var = 'Comparison') %>% 
+      rename('P.adj' = 'p adj') %>% 
+      select(Comparison, P.adj)
+    }
+  else {
+    test = 'Kruskal-Wallace'
+    aov <- kruskal.test(data[[i]] ~ treatment, data = data)
+    anova.p <- aov$p.value
+    post.hoc <- dunnTest(data[[i]] ~ treatment, data = data)
+    post.hoc <- as.data.frame(post.hoc$res) %>% 
+      select(Comparison,P.adj)
+  }
+  
+  return(data.frame(measurement = i,
+                    day = .x,
+                    shapiro_pval = shapiro.p,
+                    test = test,
+                    anova_pval = anova.p) %>% 
+           plyr::rbind.fill(., as.data.frame(post.hoc)) %>% 
+           mutate(across(where(is.numeric), round, 5))
+           )  
+  }
+
+measurements <- c('total_length','eye_area','total_length','eye_area')
+timepoints <- c(0,0,6,6)
+
+morph.statistics <- map2_df(measurements,timepoints, morph.stats.FUN)
+
+
+### Save statistics as docx table
+
+library(flextable)
+save_as_docx(flextable(morph.statistics), path = "~/Desktop/morph.stats.docx")
+
+```
+
+```{r plot data with signicance indicated}
+
+# Calculate mean and standard deviations for barplots
+
+morph.means <- morph.data %>% 
+  group_by(treatment,days_post_hatch) %>% 
+  summarise(length_mean = mean(total_length, na.rm = T),
+            length_sd = sd(total_length, na.rm = T),
+            eye_mean = mean(eye_area, na.rm = T),
+            eye_sd = sd(eye_area, na.rm = T))
+
+## E1 day 0 eye area ####  
+issah.day0.eye.plot <- 
+  ggplot(filter(morph.means,days_post_hatch == 0),
+         aes(x = treatment, y = eye_mean, 
+             fill = treatment, shape = treatment, color = treatment)) +
+  geom_col(alpha = 0.5, width = 0.35) +
+  geom_errorbar(aes(ymin=eye_mean-eye_sd, ymax=eye_mean+eye_sd), width=.25,
+                position=position_dodge(0.6), color = 'grey20') +
+  geom_jitter(width = 0.1,
+              alpha = 0.5,
+              color = 'black',
+              data = filter(morph.data, days_post_hatch == 0), 
+              aes(treatment, eye_area)) +
+    labs(x = '',
+       y = expression(eye~ area ~ (mm^2)),
+       color = '',
+       fill = '') +
+  theme_classic(base_size = 9.5) +
+  scale_fill_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+  scale_color_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+  theme(axis.text = element_text(color = "black"),
+        legend.position = 'none',
+        legend.background = element_blank(),
+        axis.line = element_line(size = 0.4),
+        #plot.margin = unit(c(0, 0, -0.5, 0), 'cm'),
+        plot.background = element_rect(fill = NA),
+        axis.text.x = element_text(angle = 40, vjust = 0.6),
+        axis.title.y = element_text(size = 8)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                     breaks = seq(0,2000,1000)) +
+  scale_x_discrete(labels = issah.conc.labels) +
+  scale_shape_manual(values = c(21L,22L,23L,24L)) +
+  coord_cartesian(ylim = c(0,2000), clip = 'off') +
+  annotate('segment', x = 0.85, xend = 3.15, y = 1950, yend = 1950, size = 0.2) +
+  annotate('segment', x = 0.85, xend = 0.85, y = 1950, yend = 1900, size = 0.2) +
+  annotate('segment', x = 3.15, xend = 3.15, y = 1950, yend = 1900, size = 0.2) +
+  annotate('segment', x = 2, xend = 2, y = 1950, yend = 2100, size = 0.2) +
+  annotate('segment', x = 2, xend = 4, y = 2100, yend = 2100, size = 0.2) +
+  annotate('segment', x = 4, xend = 4, y = 2100, yend = 1700, size = 0.2) +
+  annotate('text', x = 3, y = 2150, label = "*", size = 6)
+
+## E1 day 0 total length ####  
+issah.day0.length.plot <- ggplot(filter(morph.means,days_post_hatch == 0),
+                                 aes(x = treatment, y = length_mean, fill = treatment, shape = treatment, color = treatment)) +
+  geom_col(alpha = 0.5, width = 0.35) +
+  geom_jitter(width = 0.1, 
+              data = filter(morph.data, days_post_hatch == 0), 
+              aes(treatment, total_length),
+              color = 'black') +
+  geom_errorbar(aes(ymin=length_mean-length_sd, ymax=length_mean+length_sd), width=.25,
+                position=position_dodge(0.6), color = 'grey20') +
+  theme_classic(base_size = 9.5) +
+  scale_fill_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+  scale_color_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+  theme(axis.text = element_text(color = "black"),
+        legend.position = 'none',
+        legend.background = element_blank(),
+        axis.line = element_line(size = 0.4),
+        #plot.margin = unit(c(0, 0, -0.5, 0), 'cm'),
+        plot.background = element_rect(fill = NA),
+        axis.text.x = element_text(angle = 40, vjust = 0.6),
+        axis.title.y = element_text(size = 8)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = '',
+       y = 'total length (mm)') +
+  scale_x_discrete(labels = issah.conc.labels) +
+  scale_shape_manual(values = c(21L,22L,23L,24L))
+
+
+## E1 Day 6 eye area ####
+issah.day6.eye.plot <- ggplot(filter(morph.means,days_post_hatch == 6),
+       aes(x = treatment, y = eye_mean, fill = treatment, shape = treatment, color = treatment)) +
+  geom_col(alpha = 0.5, width = 0.35) +
+  geom_errorbar(aes(ymin=eye_mean-eye_sd, ymax=eye_mean+eye_sd), width=.25,
+                position=position_dodge(0.6), color = 'grey20') +
+  geom_jitter(width = 0.1,
+              alpha = 0.5,
+              color = 'black',
+              data = filter(morph.data, days_post_hatch == 6), 
+              aes(treatment, eye_area)) +
+  labs(x = '',
+       y = expression(eye~ area ~ (mm^2))) +
+  theme_classic(base_size = 9.5) +
+  scale_fill_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+  scale_color_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+  theme(axis.text = element_text(color = "black"),
+        legend.position = 'none',
+        legend.background = element_blank(),
+        axis.line = element_line(size = 0.4),
+        #plot.margin = unit(c(0.9, 0, -0, 0), 'cm'),
+        plot.background = element_rect(fill = NA),
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 8)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                     breaks = seq(0,2000,1000)) +
+  scale_x_discrete(labels = issah.conc.labels) +
+  scale_shape_manual(values = c(21L,22L,23L,24L)) +
+  coord_cartesian(ylim = c(0,2000), clip = 'off') +
+  annotate('segment', x = 0.75, xend = 2.25, y = 2300, yend = 2300, size = 0.2) +
+  annotate('segment', x = 0.75, xend = 0.75, y = 2300, yend = 2200, size = 0.2) +
+  annotate('segment', x = 2.25, xend = 2.25, y = 2300, yend = 2200, size = 0.2) +
+  annotate('segment', x = 1.5, xend = 1.5, y = 2300, yend = 2800, size = 0.2) +
+  annotate('segment', x = 1.5, xend = 3, y = 2400, yend = 2400, size = 0.2) +
+  annotate('segment', x = 3, xend = 3, y = 2400, yend = 1750, size = 0.2) +
+  annotate('text', x = 2.4, y = 2420, label = "***", size = 4.5) +
+  annotate('segment', x = 1.5, xend = 4, y = 2800, yend = 2800, size = 0.2) +
+  annotate('segment', x = 4, xend = 4, y = 2800, yend = 1300, size = 0.2) +
+  annotate('text', x = 3.0, y = 2820, label = "***", size = 4.5) +
+  annotate('segment', x = 3, xend = 4, y = 1900, yend = 1900, size = 0.2) +
+  annotate('text', x = 3.5, y = 1920, label = "*", size = 4.5)
+
+## E1 Day 6 total length ####
+issah.day6.length.plot <- ggplot(filter(morph.means,days_post_hatch == 6),
+       aes(x = treatment, y = length_mean, fill = treatment, shape = treatment, color = treatment)) +
+  geom_col(alpha = 0.5, width = 0.35) +
+  geom_errorbar(aes(ymin=length_mean-length_sd, ymax=length_mean+length_sd), width=.25,
+                position=position_dodge(0.6), color = 'grey20') +
+  geom_jitter(width = 0.1,
+              alpha = 0.5,
+              color = 'black',
+              data = filter(morph.data, days_post_hatch == 6), 
+              aes(treatment, total_length)) +
+  labs(x = '',
+       y = 'total length (mm)') +
+  theme_classic(base_size = 9.5) +
+  scale_fill_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+  scale_color_manual(values = c("lightblue3","khaki3","darkgoldenrod2","orangered3")) +
+  theme(axis.text = element_text(color = "black"),
+        legend.position = 'none',
+        legend.background = element_blank(),
+        axis.line = element_line(size = 0.4),
+        plot.margin = unit(c(0.25, 0, -0, 0), 'cm'),
+        plot.background = element_rect(fill = NA),
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 8)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)),
+                     breaks = seq(0,20,10)) +
+  scale_x_discrete(labels = issah.conc.labels) +
+  scale_shape_manual(values = c(21L,22L,23L,24L)) +
+  coord_cartesian(ylim = c(0,20), clip = 'off') +
+  annotate('segment', x = 2.75, xend = 2.75, y = 19, yend = 20.5, size = 0.2) +
+  annotate('segment', x = 2.75, xend = 4.25, y = 20.5, yend = 20.5, size = 0.2) +
+  annotate('segment', x = 2.75, xend = 2.75, y = 19, yend = 20.5, size = 0.2) +
+  annotate('segment', x = 4.25, xend = 4.25, y = 19, yend = 20.5, size = 0.2) +
+  annotate('segment', x = 3.5, xend = 3.5, y = 20.5, yend = 23, size = 0.2) +
+  annotate('segment', x = 3.5, xend = 2, y = 23, yend = 23, size = 0.2) +
+  annotate('segment', x = 2, xend = 2, y = 23, yend = 21.5, size = 0.2) +
+  annotate('text', x = 2.7, y = 23.2, label = "*", size = 5)
+
+
+
+```
+### Final Figure 3 morphology
+```{r final figure 3}
+
+## Final Figure 3 four panel
+
+quartz(height = unit(3,'in'), width = unit(4,'in'))
+
+plot_grid(plot_grid(issah.day0.eye.plot + 
+                      theme(axis.text.x = element_blank(),
+                            axis.ticks.x = element_blank(),
+                            plot.margin = unit(c(0, 0, 0, 0.5), 'cm')),
+                    issah.day0.length.plot + 
+                      theme(axis.text.x = element_blank(),
+                            axis.ticks.x = element_blank()),
+                    NULL,
+                    NULL,
+                    issah.day6.eye.plot + 
+                      theme(axis.text.x = element_blank(),
+                            axis.ticks.x = element_blank(),
+                            plot.margin = unit(c(0, 0, 0, 0.5), 'cm')),
+                    issah.day6.length.plot+
+                      theme(axis.text.x = element_blank(),
+                            axis.ticks.x = element_blank()),
+                    align = 'hv',
+                    ncol = 2,
+                    nrow = 3,
+                    labels = c("A","","B",""),
+                    label_fontface = 'plain',
+                    label_size = 11,
+                    rel_heights = c(1,0.2,1)),
+          get_legend(issah.day0.eye.plot +
+                       guides(fill = guide_legend(override.aes = list(shape = NA)),
+                              shape = 'none') +
+                       theme(legend.position = 'top',
+                             #legend.key.width = unit(0.1,'in'),
+                             legend.key.size = unit(0.15,'in'),
+                             legend.text = element_text(size = 9))),
+          ncol = 1,
+          rel_heights = c(2,0.2))
+
+
+```

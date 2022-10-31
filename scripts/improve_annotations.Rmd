@@ -1,0 +1,94 @@
+---
+title: "Coho improved annotations"
+author: "J Greer"
+date: "4/8/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, tidy = TRUE, message = FALSE,warning = FALSE)
+```
+
+```{r load packages, echo= FALSE}
+library(org.Hs.eg.db)
+library(janitor)
+library(readxl)
+library(tidyverse)
+
+```
+
+```{r add entrez and human annotations, eval = F}
+
+# NCBI annotations 
+
+annotations <- read_tsv("annotations/GCF_002021735.2_Okis_V2_feature_table.txt") %>% 
+  clean_names()  %>% 
+  # Only keep mRNAs and ncRNAs for downstream analysis
+  filter(number_feature %in% c("mRNA","ncRNA")) %>% 
+  arrange(name) %>% 
+  # Keep relevant columns
+  dplyr::select(genomic_accession,product_accession,related_accession:gene_id) %>% 
+  mutate(related_accession = str_replace(related_accession,"\\.\\d",""))
+
+
+
+##Add ENSEMBL coho symbols
+
+annotations2 <- read_tsv("annotations/ensembl_annotations.txt") %>% 
+  dplyr::select(gene_id:gene_symbol) %>% 
+  plyr::join(annotations, ., by = 'gene_id', match = 'first', type = 'left') %>% 
+  arrange(gene_symbol) %>% 
+  # Aggregated to gene level for RNASeq, only need each gene once
+  distinct(gene_id, .keep_all = T) %>%  
+  # Replace genes without symbols (LOC) with none
+  mutate(symbol = case_when(str_detect(symbol,"^LOC") ~ 'none',
+                            TRUE ~ symbol)) %>% 
+  # If the value for symbol column is none, replace with NA
+  mutate(symbol = na_if(symbol, 'none')) %>% 
+  # If no symbol from NBCI, replace column (coalesce) with eNSEMBL symbol
+  mutate(symbol = coalesce(symbol,gene_symbol)) %>%   
+  # Remove now redundant gene_symbol column from ENSEMBL annotations
+  dplyr::select(-gene_symbol)
+
+
+
+# Add human annotations if still unannotated
+product.keys <- keys(org.Hs.eg.db,keytype="SYMBOL")
+cols <- c("UNIPROT","ENSEMBL",'GENENAME',"ENTREZID")
+human.gene.symbols <- 
+  AnnotationDbi::select(org.Hs.eg.db,keys=product.keys,columns =
+                          cols,keytype="SYMBOL") %>% 
+  dplyr::rename("name" = "GENENAME") %>% 
+  mutate(name = tolower(name))
+
+
+# Gene name adjustments are needed to match human naming style
+unannotated <- filter(annotations2, is.na(symbol)) %>%  #only genes without symbols
+  mutate(name = str_replace(name,"-like", ""),
+         name = str_replace(name,", transcript variant X\\d", ""),
+         name = str_replace(name,"-", " "),
+         name = str_replace(name, 'acyl coenzyme A', 'acyl-coA'),
+         name = tolower(name)) %>% 
+  plyr::join(.,human.gene.symbols, by = 'name', type = 'left',
+             match = 'first') %>% 
+  mutate(symbol = coalesce(symbol,SYMBOL)) %>% 
+  select(-SYMBOL)
+
+
+# Create final df from annotated and unannotated with human symbol
+final.anno <- annotations2 %>%
+  drop_na(symbol) %>% 
+  bind_rows(., unannotated) %>% 
+  mutate(symbol = toupper(symbol))
+
+# Remove temporary files for space
+rm(annotations2,human.gene.symbols,unannotated, product.keys,
+   cols)
+
+# Save final annotations for downstream RNASeq use
+write_tsv(final.anno, "annotations/final.annotations.txt")
+
+
+```
